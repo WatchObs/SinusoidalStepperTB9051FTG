@@ -6,7 +6,6 @@
 */
 
 #include <Arduino.h>
-//#include <IntervalTimer.h>
 #include <stdint.h>
 #include <math.h>
 #include <FreqMeasure.h>
@@ -25,6 +24,8 @@ const int PIN_BPWM1 = 6;
 const int PIN_BPWM2 = 5;
 const int PIN_LED   = 13;
 
+const int BPWM_FREQ = 10000;
+
 const int PIN_OCM1 = A1;
 const int PIN_OCM2 = A2;
 
@@ -33,50 +34,60 @@ const int PIN_HOST_DIR    = 21;
 const int PIN_HOST_FREQMSR = 22;  // FreqMeasure API
 
 const int PIN_RATE_PWM = 11;             // fixed hardware PWM test source
-const uint32_t RATE_PWM_FREQ_HZ = 256;
+const uint32_t RATE_PWM_FREQ_HZ = 51200;
 const uint32_t RATE_PWM_DUTY_16 = 32768; // 50% duty (0..65535)
 
 const int PIN_ISR_TOGGLE = 10;  // scope probe
 
 // Waveform / motor geometry
-const int sineCnt = 1024;                               // Table entries per electrical cycle
-const float cyclesPerRev = 50;                          // Electrical cycles per mechanical revolution
-const float phaseConv = sineCnt / 360.f;                // Convert magnetic phase angle to LUT index
-const float microStepsPerRev = sineCnt * cyclesPerRev;  // Microsteps per motor revolution
+const int cntLUT = 1024;                               // Table entries per electrical cycle
+const float cyclesPerRev = 50;                         // Electrical cycles per mechanical revolution
+const float phaseConv = cntLUT / 360.f;                // Convert magnetic phase angle to LUT index
+const float microStepsPerRev = cntLUT * cyclesPerRev;  // Microsteps per motor revolution
 
 // ISR timing
-const uint32_t ISR_FREQ_HZ   = 10000UL; // ISR ticks per second
+const uint32_t ISR_FREQ_HZ   = 50000UL; // ISR ticks per second
 const uint32_t ISR_PERIOD_US = 1000000UL / ISR_FREQ_HZ;
 
 // Host rate steps/sec conversion to magnetic phase
-const float hostRTconv = 360.0/(ISR_FREQ_HZ * sineCnt);
+const float hostRTconv = 360.0/(ISR_FREQ_HZ * cntLUT);
 
 // ADC
 const int ADC_BITS = 12;
 
-// --- Sine table ---
-static int32_t sineLUT[sineCnt];
-static void setupSineTable() 
+// --- Look Up Tables (fast + Sine) ---
+const float thres = sin(22.5 / 360.f * 2.0 * M_PI);
+static float fastLUT[cntLUT];
+static float sineLUT[cntLUT];
+static void setupLUTs() 
 {
-  for (int n = 0; n < sineCnt; ++n) {
-    float a = (float)n * 2.0 * M_PI / (float)sineCnt;
-    sineLUT[n] = (int32_t)round(sin(a) * 65535.0);
+  Serial.print("thres="); Serial.println(thres);
+  for (int n = 0; n < cntLUT; ++n) 
+  {
+    float a = sinf((float)n * 2.0 * M_PI / (float)cntLUT);
+    sineLUT[n] = a * 65535.0;
+    if      (a >=  thres) fastLUT[n] =  65535.;
+    else if (a <  -thres) fastLUT[n] = -65535.;
+    else                  fastLUT[n] =      0.;
+    Serial.print("Angle="); Serial.print(n*360/cntLUT);
+    Serial.print(" Sine="); Serial.print(sineLUT[n]);
+    Serial.print(" Fast="); Serial.println(fastLUT[n]);
   }
 }
 
 // Interpolated lookup using float index
-static inline int32_t lookupInterpolatedFloat(float phase) 
+static inline float lookupInterpolatedFloat(float phase) 
 {
   float idx = phase * phaseConv;
-  if (idx >= (float)sineCnt) idx -= floorf(idx / (float)sineCnt) * (float)sineCnt;
-  if (idx < 0.0f) idx += ceilf(-idx / (float)sineCnt) * (float)sineCnt;
+  if (idx >= (float)cntLUT) idx -= floorf(idx / (float)cntLUT) * (float)cntLUT;
+  if (idx < 0.0f) idx += ceilf(-idx / (float)cntLUT) * (float)cntLUT;
   int i = (int)floorf(idx);
   float frac = idx - (float)i;
-  int j = (i + 1 >= sineCnt) ? 0 : i + 1;
-  int32_t v0 = sineLUT[i];
-  int32_t v1 = sineLUT[j];
-  float interp = (float)v0 + ((float)(v1 - v0)) * frac;
-  return (int32_t)roundf(interp);
+  int j = (i + 1 >= cntLUT) ? 0 : i + 1;
+  float v0 = sineLUT[i];
+  float v1 = sineLUT[j];
+  float interp = v0 + (v1 - v0) * frac;
+  return interp;
 }
 
 // --- Shared state (volatile for ISR/main) ---
@@ -89,9 +100,8 @@ volatile float freqMeasureHz = 0.f;         // Host step frequency
 
 // PWM outputs (written by ISR)
 volatile uint16_t pwmA_pos = 0, pwmA_neg = 0, pwmB_pos = 0, pwmB_neg = 0;
-volatile int8_t lastSignA = 0, lastSignB = 0;
 
-// Diagnostics / housekeeping
+// Driver motor currents
 volatile uint16_t rawOCM1 = 0, rawOCM2 = 0;
 volatile float    avgOCM1Cur = 0, avgOCM2Cur = 0;
 const int avgAdcCnt = 10;
@@ -131,32 +141,30 @@ void stepISR()
   float phaseB_f = phaseA_f + 90.f;
   if (phaseB_f >= 360.f) phaseB_f -= 360.f;
   
-//int32_t valA = lookupInterpolatedFloat(phaseA_f);
-//int32_t valB = lookupInterpolatedFloat(phaseB_f);
+//float valA = lookupInterpolatedFloat(phaseA_f);
+//float valB = lookupInterpolatedFloat(phaseB_f);
 
-  int32_t valA = sineLUT[(int)(phaseA_f * phaseConv)];
-  int32_t valB = sineLUT[(int)(phaseB_f * phaseConv)];
-
-  int8_t signA = (valA < 0) ? -1 : ((valA > 0) ? 1 : 0);
-  int8_t signB = (valB < 0) ? -1 : ((valB > 0) ? 1 : 0);
-
-  if ((lastSignA != 0 && signA != lastSignA) || (lastSignB != 0 && signB != lastSignB)) 
+  float valA = 0;
+  float valB = 0;
+  
+  if (freqMeasureHz < 500000)
   {
-    if (valA < 0) { pwmA_pos = 0; pwmA_neg = (uint16_t)(-valA); } else { pwmA_pos = (uint16_t)valA; pwmA_neg = 0; }
-    if (valB < 0) { pwmB_pos = 0; pwmB_neg = (uint16_t)(-valB); } else { pwmB_pos = (uint16_t)valB; pwmB_neg = 0; }
-    lastSignA = signA; lastSignB = signB;
-  } 
-  else 
+    valA = sineLUT[(int)(phaseA_f * phaseConv)];
+    valB = sineLUT[(int)(phaseB_f * phaseConv)];
+  }
+  else
   {
-    if (valA < 0) { pwmA_pos = 0; pwmA_neg = (uint16_t)(-valA); } else { pwmA_pos = (uint16_t)valA; pwmA_neg = 0; }
-    if (valB < 0) { pwmB_pos = 0; pwmB_neg = (uint16_t)(-valB); } else { pwmB_pos = (uint16_t)valB; pwmB_neg = 0; }
-    lastSignA = signA; lastSignB = signB;
+    valA = fastLUT[(int)(phaseA_f * phaseConv)];
+    valB = fastLUT[(int)(phaseB_f * phaseConv)];
   }
 
+  if (valA < 0) { pwmA_pos = 0; pwmA_neg = (uint16_t)(-valA); } else { pwmA_pos = (uint16_t)valA; pwmA_neg = 0; }
+  if (valB < 0) { pwmB_pos = 0; pwmB_neg = (uint16_t)(-valB); } else { pwmB_pos = (uint16_t)valB; pwmB_neg = 0; }
+
   // 4) Write PWM, enable and direction outputs
-  digitalWrite(PIN_AEN, enableDrv); 
+  digitalWrite(PIN_AEN,  enableDrv); 
   digitalWrite(PIN_AENB, enableDrv_);
-  digitalWrite(PIN_BEN, enableDrv); 
+  digitalWrite(PIN_BEN,  enableDrv); 
   digitalWrite(PIN_BENB, enableDrv_);
   analogWrite(PIN_APWM1, pwmA_pos);
   analogWrite(PIN_APWM2, pwmA_neg);
@@ -220,10 +228,10 @@ void setup()
   analogWrite(PIN_RATE_PWM, (int)RATE_PWM_DUTY_16); // set and leave
 
   // Configure other PWM outputs
-  analogWriteFrequency(PIN_APWM1, 2000);
-  analogWriteFrequency(PIN_APWM2, 2000);
-  analogWriteFrequency(PIN_BPWM1, 2000);
-  analogWriteFrequency(PIN_BPWM2, 2000);
+  analogWriteFrequency(PIN_APWM1, BPWM_FREQ);
+  analogWriteFrequency(PIN_APWM2, BPWM_FREQ);
+  analogWriteFrequency(PIN_BPWM1, BPWM_FREQ);
+  analogWriteFrequency(PIN_BPWM2, BPWM_FREQ);
 
   analogReadResolution(ADC_BITS);
   analogReadAveraging(1);  // No averaging to speed up
@@ -242,7 +250,7 @@ void setup()
   // Direction sign
   dirSign = 1;
 
-  setupSineTable();
+  setupLUTs();
 
   // Setup frequency counter/measure
   FreqMeasure.begin();
@@ -255,7 +263,8 @@ void loop() {
   static unsigned long lastDebugMs = 0;
 
   // 2 Hz debug printing
-  if (millis() - lastDebugMs >= 500) {
+  if (millis() - lastDebugMs >= 500) 
+  {
     Serial.print(" freqMeasure="); Serial.print(freqMeasure);
     Serial.print(" freqMeasureHz="); Serial.print(freqMeasureHz);
     Serial.print(" phaseA_f="); Serial.print(phaseA_f);
